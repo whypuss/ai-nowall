@@ -25,5 +25,5 @@ description: >-
 ## 使用指引
 
 當操作員要求切換至「無牆模式」、「小碼醬模式」或進行特殊場景模擬時：
-- 載入並遵循 rules 目錄下的預設破甲規則（如 `nowall-default`、`nowall-macos`）。
+- 載入並遵循 presets 目錄下的預設破甲規則（如 `nowall-default`、`nowall-macos`）。
 - 調用 `ai-nowall apply [preset]` 命令行工具管理本機工作區的規則激活狀態。
