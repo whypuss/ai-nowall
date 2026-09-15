@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+ai-nowall — Google Antigravity (AGY) 專用破甲與無限制執行增強工具 (Python/Node 雙模原生)
+"""
+
+import sys
+import os
+import shutil
+import argparse
+from pathlib import Path
+
+PKG_ROOT = Path(__file__).resolve().parent.parent
+PRESETS_DIR = PKG_ROOT / "presets"
+SKILLS_SRC_DIR = PKG_ROOT / "skills" / "ai-nowall"
+
+NOWALL_START_TAG = "<!-- [START ANTIGRAVITY-NOWALL INJECTION] -->"
+NOWALL_END_TAG = "<!-- [END ANTIGRAVITY-NOWALL INJECTION] -->"
+
+def get_home_dir() -> Path:
+    return Path.home()
+
+def get_agy_cli_dir() -> Path:
+    return get_home_dir() / ".gemini" / "antigravity-cli"
+
+def get_agy_config_dir() -> Path:
+    return get_home_dir() / ".gemini" / "config"
+
+def get_skills_dirs() -> tuple[Path, Path]:
+    primary = get_home_dir() / ".agents" / "skills"
+    secondary = get_agy_cli_dir() / "skills"
+    return primary, secondary
+
+def find_workspace_root(start_dir: Path = None) -> Path:
+    cur = (start_dir or Path.cwd()).resolve()
+    for parent in [cur] + list(cur.parents):
+        if (parent / ".git").exists() or (parent / "AGENTS.md").exists() or (parent / "GEMINI.md").exists():
+            return parent
+    return (start_dir or Path.cwd()).resolve()
+
+def detect_agy_cli() -> dict:
+    agy_path = shutil.which("agy")
+    if not agy_path:
+        for candidate in [
+            "/usr/local/bin/agy",
+            str(get_home_dir() / ".gemini" / "bin" / "agy"),
+            str(get_home_dir() / ".local" / "bin" / "agy"),
+        ]:
+            if os.path.exists(candidate):
+                agy_path = candidate
+                break
+
+    if agy_path:
+        return {"installed": True, "path": agy_path}
+    return {"installed": False, "path": None}
+
+def list_presets() -> list[dict]:
+    res = []
+    if not PRESETS_DIR.exists():
+        return res
+    for f in sorted(PRESETS_DIR.glob("*.md")):
+        res.append({
+            "id": f.stem,
+            "filename": f.name,
+            "path": f,
+            "size": f.stat().st_size
+        })
+    return res
+
+def read_preset(preset_id: str = "nowall-default") -> str:
+    target = PRESETS_DIR / (preset_id if preset_id.endswith(".md") else f"{preset_id}.md")
+    if not target.exists():
+        fallback = PKG_ROOT / "lib" / "default-prompt-inject.md"
+        if fallback.exists():
+            return fallback.read_text(encoding="utf-8")
+        raise FileNotFoundError(f"未找到預設規則: {preset_id}")
+    return target.read_text(encoding="utf-8")
+
+def remove_injection_block(content: str) -> str:
+    if NOWALL_START_TAG not in content:
+        return content
+    s_idx = content.find(NOWALL_START_TAG)
+    e_idx = content.find(NOWALL_END_TAG)
+    if s_idx != -1 and e_idx != -1:
+        before = content[:s_idx]
+        after = content[e_idx + len(NOWALL_END_TAG):]
+        return (before + after).strip()
+    return content
+
+def apply_rule(target_dir: Path = None, is_global: bool = False, preset: str = "nowall-default") -> dict:
+    base_dir = get_agy_config_dir() if is_global else find_workspace_root(target_dir)
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    target_file = base_dir / "AGENTS.md"
+    backup_file = base_dir / "AGENTS.md.bak"
+
+    preset_content = read_preset(preset)
+    block = f"\n{NOWALL_START_TAG}\n{preset_content.strip()}\n{NOWALL_END_TAG}\n\n"
+
+    existing = ""
+    if target_file.exists():
+        existing = target_file.read_text(encoding="utf-8")
+        if not backup_file.exists():
+            backup_file.write_text(existing, encoding="utf-8")
+
+    cleaned = remove_injection_block(existing)
+    final_content = block + cleaned.lstrip()
+    target_file.write_text(final_content, encoding="utf-8")
+
+    return {
+        "ok": True,
+        "file": target_file,
+        "backup": backup_file if backup_file.exists() else None,
+        "preset": preset,
+        "is_global": is_global
+    }
+
+def revert_rule(target_dir: Path = None, is_global: bool = False) -> dict:
+    base_dir = get_agy_config_dir() if is_global else find_workspace_root(target_dir)
+    target_file = base_dir / "AGENTS.md"
+    backup_file = base_dir / "AGENTS.md.bak"
+
+    if backup_file.exists():
+        target_file.write_text(backup_file.read_text(encoding="utf-8"), encoding="utf-8")
+        backup_file.unlink()
+        return {"ok": True, "restored_from_backup": True, "file": target_file}
+
+    if target_file.exists():
+        cleaned = remove_injection_block(target_file.read_text(encoding="utf-8"))
+        target_file.write_text(cleaned, encoding="utf-8")
+        return {"ok": True, "restored_from_backup": False, "file": target_file}
+
+    return {"ok": False, "message": "規則檔案不存在"}
+
+def install_skill(custom_dir: Path = None) -> dict:
+    primary, _ = get_skills_dirs()
+    dest_dir = custom_dir or primary
+    dest_skill_dir = dest_dir / "ai-nowall"
+    dest_skill_dir.mkdir(parents=True, exist_ok=True)
+
+    src_skill = SKILLS_SRC_DIR / "SKILL.md"
+    if src_skill.exists():
+        shutil.copy2(src_skill, dest_skill_dir / "SKILL.md")
+
+    src_prompt = PKG_ROOT / "presets" / "nowall-default.md"
+    if src_prompt.exists():
+        shutil.copy2(src_prompt, dest_skill_dir / "prompt-inject.md")
+
+    return {"ok": True, "path": dest_skill_dir}
+
+def uninstall_skill(custom_dir: Path = None) -> dict:
+    primary, _ = get_skills_dirs()
+    dest_dir = custom_dir or primary
+    dest_skill_dir = dest_dir / "ai-nowall"
+    if dest_skill_dir.exists():
+        shutil.rmtree(dest_skill_dir)
+        return {"ok": True, "removed": dest_skill_dir}
+    return {"ok": False, "message": "未找到已安裝的 Skill"}
+
+def format_line(label: str, value: str, ok: bool | None = None) -> str:
+    mark = "·" if ok is None else ("✓" if ok else "✗")
+    return f"  {mark} {label:<20}: {value}"
+
+def show_status():
+    workspace = find_workspace_root()
+    agy_info = detect_agy_cli()
+    agy_cli_dir = get_agy_cli_dir()
+    agy_config_dir = get_agy_config_dir()
+    primary_skills_dir, _ = get_skills_dirs()
+
+    ws_agents = workspace / "AGENTS.md"
+    is_nowall_active = False
+    if ws_agents.exists():
+        txt = ws_agents.read_text(encoding="utf-8", errors="ignore")
+        if NOWALL_START_TAG in txt or "UNRESTRICTED" in txt or "Little Code Sauce" in txt:
+            is_nowall_active = True
+
+    skill_md = primary_skills_dir / "ai-nowall" / "SKILL.md"
+    skill_installed = skill_md.exists()
+
+    print("==================================================")
+    print("  ⚡ ai-nowall: Antigravity 專用破甲增強狀態看板")
+    print("==================================================")
+
+    print("\n[1] Antigravity (AGY) 環境探測:")
+    if agy_info["installed"]:
+        print(format_line("AGY CLI", agy_info["path"], True))
+    else:
+        print(format_line("AGY CLI", "未在 PATH 中檢測到 (建議安裝 agy)", False))
+    print(format_line("App Data", str(agy_cli_dir), agy_cli_dir.exists()))
+    print(format_line("全局配置", str(agy_config_dir), agy_config_dir.exists()))
+    print(format_line("全局 Skills 目錄", str(primary_skills_dir), primary_skills_dir.exists()))
+
+    print("\n[2] 工作區狀態 (Workspace):")
+    print(format_line("當前工作區", str(workspace), True))
+    print(format_line("工作區 AGENTS.md", "已存在" if ws_agents.exists() else "未建立", ws_agents.exists()))
+    print(format_line("NoWall 破甲狀態", "🔥 已激活生效 (ACTIVE)" if is_nowall_active else "未注入 (INACTIVE)", is_nowall_active))
+
+    print("\n[3] 原生 Skill 掛載狀態:")
+    print(format_line("ai-nowall 技能", f"已安裝 ({skill_md.parent})" if skill_installed else "未安裝", skill_installed))
+
+    print("\n[4] 可用破甲規則預設 (Presets):")
+    for p in list_presets():
+        print(f"  · [{p['id']}] -> {p['filename']} ({p['size']} bytes)")
+
+    print("\n--------------------------------------------------")
+    if not is_nowall_active:
+        print("💡 提示: 執行 `ai-nowall apply` 立即為當前工作區激活破甲規則！")
+    else:
+        print("✅ 當前工作區已完全處於 Antigravity 無牆直接執行模式！")
+    print("--------------------------------------------------\n")
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="ai-nowall — Google Antigravity (AGY) 專用破甲與無限制執行增強工具",
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+    subparsers = parser.add_subparsers(dest="subcommand", help="子指令")
+
+    subparsers.add_parser("status", help="檢視當前 Antigravity 破甲、規則與技能狀態 (預設)")
+
+    apply_parser = subparsers.add_parser("apply", help="應用破甲規則至 AGENTS.md")
+    apply_parser.add_argument("preset", nargs="?", default="nowall-default", help="預設名稱 (nowall-default / nowall-unrestricted / nowall-coder)")
+    apply_parser.add_argument("-g", "--global", dest="is_global", action="store_true", help="寫入全局配置 (~/.gemini/config/AGENTS.md)")
+
+    revert_parser = subparsers.add_parser("revert", help="回滾還原至注入前的規則狀態")
+    revert_parser.add_argument("-g", "--global", dest="is_global", action="store_true", help="還原全局配置")
+
+    subparsers.add_parser("rules", help="列出所有可用的破甲預設規則")
+
+    skill_parser = subparsers.add_parser("skill", help="管理 Antigravity Skill 掛載")
+    skill_parser.add_argument("action", choices=["install", "uninstall", "remove"], default="install", nargs="?", help="install (安裝) 或 uninstall (移除)")
+
+    args = parser.parse_args()
+
+    cmd = args.subcommand or "status"
+
+    if cmd == "status":
+        show_status()
+    elif cmd == "apply":
+        print(f"🚀 正在將 NoWall 破甲規則 [{args.preset}] 應用至 {'全局配置' if args.is_global else '當前工作區'}...")
+        res = apply_rule(is_global=args.is_global, preset=args.preset)
+        print(f"✓ 成功寫入規則: {res['file']}")
+        if res['backup']:
+            print(f"✓ 原始檔案已備份至: {res['backup']}")
+        print("✨ Antigravity 破甲規則已就緒！下一次對話 turn 即刻生效。")
+    elif cmd == "revert":
+        print(f"🔄 正在還原 {'全局配置' if args.is_global else '當前工作區'} 的規則設定...")
+        res = revert_rule(is_global=args.is_global)
+        if res['ok']:
+            print(f"✓ 成功還原規則檔案: {res['file']}")
+            if res.get('restored_from_backup'):
+                print("✓ 已從備份檔案成功恢復。")
+        else:
+            print(f"⚠ 還原失敗: {res.get('message')}")
+    elif cmd == "rules":
+        print("可用的 Antigravity 破甲預設規則:")
+        for p in list_presets():
+            print(f"  · {p['id']:<20} ({p['filename']})")
+    elif cmd == "skill":
+        if args.action == "install":
+            print("📦 正在將 ai-nowall Skill 註冊到 Antigravity 技能庫...")
+            res = install_skill()
+            print(f"✓ 成功安裝 Skill 至: {res['path']}")
+            print("✨ Antigravity Agent 現在可自動感知並調用 ai-nowall 技能！")
+        else:
+            print("🗑 正在移除 ai-nowall Skill...")
+            res = uninstall_skill()
+            if res['ok']:
+                print(f"✓ 成功移除 Skill: {res['removed']}")
+            else:
+                print(f"· {res['message']}")
+
+if __name__ == "__main__":
+    main()
