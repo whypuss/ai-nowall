@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ai-nowall — Google Antigravity (AGY) 專用破甲與無限制執行增強工具 (Python/Node 雙模原生)
+ai-nowall — Google Antigravity (AGY) 專用破甲與無限制執行增強工具 (macOS 原生深度適配)
 """
 
 import sys
 import os
 import shutil
+import platform
+import subprocess
 import argparse
 from pathlib import Path
 
@@ -16,6 +18,10 @@ SKILLS_SRC_DIR = PKG_ROOT / "skills" / "ai-nowall"
 
 NOWALL_START_TAG = "<!-- [START ANTIGRAVITY-NOWALL INJECTION] -->"
 NOWALL_END_TAG = "<!-- [END ANTIGRAVITY-NOWALL INJECTION] -->"
+LAUNCHD_LABEL = "com.whypuss.ai-nowall"
+
+def is_macos() -> bool:
+    return sys.platform == "darwin"
 
 def get_home_dir() -> Path:
     return Path.home()
@@ -43,6 +49,7 @@ def detect_agy_cli() -> dict:
     if not agy_path:
         for candidate in [
             "/usr/local/bin/agy",
+            "/opt/homebrew/bin/agy",
             str(get_home_dir() / ".gemini" / "bin" / "agy"),
             str(get_home_dir() / ".local" / "bin" / "agy"),
         ]:
@@ -53,6 +60,148 @@ def detect_agy_cli() -> dict:
     if agy_path:
         return {"installed": True, "path": agy_path}
     return {"installed": False, "path": None}
+
+def detect_macos_env() -> dict:
+    if not is_macos():
+        return {"is_mac": False}
+
+    prod_ver = "unknown"
+    build_ver = "unknown"
+    try:
+        prod_ver = subprocess.check_output(["sw_vers", "-productVersion"], text=True).strip()
+        build_ver = subprocess.check_output(["sw_vers", "-buildVersion"], text=True).strip()
+    except Exception:
+        pass
+
+    arch = platform.machine()
+    is_m_series = arch in ("arm64", "aarch64")
+    brew_prefix = Path("/opt/homebrew") if is_m_series else Path("/usr/local")
+    has_brew = (brew_prefix / "bin" / "brew").exists()
+
+    zshrc = get_home_dir() / ".zshrc"
+    local_bin = str(get_home_dir() / ".local" / "bin")
+    in_path_env = local_bin in os.environ.get("PATH", "").split(":")
+    
+    in_zshrc = False
+    if zshrc.exists():
+        in_zshrc = ".local/bin" in zshrc.read_text(encoding="utf-8", errors="ignore")
+
+    plist_path = get_home_dir() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
+    plist_installed = plist_path.exists()
+    plist_loaded = False
+    try:
+        out = subprocess.check_output("launchctl list | grep -i ai-nowall || true", shell=True, text=True)
+        if LAUNCHD_LABEL in out:
+            plist_loaded = True
+    except Exception:
+        pass
+
+    return {
+        "is_mac": True,
+        "product_version": prod_ver,
+        "build_version": build_ver,
+        "arch": arch,
+        "is_apple_silicon": is_m_series,
+        "brew_prefix": brew_prefix,
+        "has_brew": has_brew,
+        "shell": os.environ.get("SHELL", "/bin/zsh"),
+        "zshrc": zshrc,
+        "in_path_env": in_path_env,
+        "in_zshrc": in_zshrc,
+        "plist_path": plist_path,
+        "plist_installed": plist_installed,
+        "plist_loaded": plist_loaded,
+    }
+
+def fix_zsh_path() -> dict:
+    home = get_home_dir()
+    local_bin = home / ".local" / "bin"
+    local_bin.mkdir(parents=True, exist_ok=True)
+
+    zshrc = home / ".zshrc"
+    line_to_add = '\n# [ai-nowall] Antigravity CLI PATH\nexport PATH="$HOME/.local/bin:$PATH"\n'
+
+    content = ""
+    if zshrc.exists():
+        content = zshrc.read_text(encoding="utf-8", errors="ignore")
+
+    if ".local/bin" not in content:
+        with open(zshrc, "a", encoding="utf-8") as f:
+            f.write(line_to_add)
+        return {"ok": True, "added": True, "file": zshrc}
+    return {"ok": True, "added": False, "message": "PATH 已存在於 .zshrc"}
+
+def clear_quarantine(target_path: Path) -> bool:
+    if not is_macos() or not target_path.exists():
+        return False
+    try:
+        subprocess.run(["xattr", "-d", "com.apple.quarantine", str(target_path)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        return False
+
+def generate_launchd_plist() -> str:
+    script_path = PKG_ROOT / "bin" / "ai-nowall"
+    python_bin = sys.executable or "/usr/bin/python3"
+    log_file = get_home_dir() / ".gemini" / "ai-nowall-agent.log"
+    err_file = get_home_dir() / ".gemini" / "ai-nowall-agent.err.log"
+
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{LAUNCHD_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{python_bin}</string>
+        <string>{script_path}</string>
+        <string>status</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>3600</integer>
+    <key>StandardOutPath</key>
+    <string>{log_file}</string>
+    <key>StandardErrorPath</key>
+    <string>{err_file}</string>
+</dict>
+</plist>
+"""
+
+def install_launchd_service() -> dict:
+    if not is_macos():
+        return {"ok": False, "message": "非 macOS 系統"}
+
+    launch_dir = get_home_dir() / "Library" / "LaunchAgents"
+    launch_dir.mkdir(parents=True, exist_ok=True)
+    plist_path = launch_dir / f"{LAUNCHD_LABEL}.plist"
+
+    content = generate_launchd_plist()
+    plist_path.write_text(content, encoding="utf-8")
+
+    uid = os.getuid()
+    try:
+        subprocess.run(f"launchctl bootout gui/{uid}/{LAUNCHD_LABEL} 2>/dev/null || true", shell=True)
+        subprocess.run(f'launchctl bootstrap gui/{uid} "{plist_path}" 2>/dev/null || launchctl load -w "{plist_path}" 2>/dev/null || true', shell=True)
+    except Exception:
+        pass
+
+    return {"ok": True, "plist_path": plist_path}
+
+def uninstall_launchd_service() -> dict:
+    if not is_macos():
+        return {"ok": False, "message": "非 macOS 系統"}
+
+    plist_path = get_home_dir() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
+    if plist_path.exists():
+        uid = os.getuid()
+        subprocess.run(f"launchctl bootout gui/{uid}/{LAUNCHD_LABEL} 2>/dev/null || launchctl unload \"{plist_path}\" 2>/dev/null || true", shell=True)
+        plist_path.unlink(missing_ok=True)
+        return {"ok": True, "removed": plist_path}
+    return {"ok": False, "message": "守護服務不存在"}
 
 def list_presets() -> list[dict]:
     res = []
@@ -167,6 +316,7 @@ def show_status():
     agy_cli_dir = get_agy_cli_dir()
     agy_config_dir = get_agy_config_dir()
     primary_skills_dir, _ = get_skills_dirs()
+    mac_info = detect_macos_env()
 
     ws_agents = workspace / "AGENTS.md"
     is_nowall_active = False
@@ -191,28 +341,86 @@ def show_status():
     print(format_line("全局配置", str(agy_config_dir), agy_config_dir.exists()))
     print(format_line("全局 Skills 目錄", str(primary_skills_dir), primary_skills_dir.exists()))
 
-    print("\n[2] 工作區狀態 (Workspace):")
+    if mac_info["is_mac"]:
+        print("\n[2] macOS 系統層適配狀態 (Darwin Native):")
+        arch_desc = "Apple Silicon (M系列 ARM64)" if mac_info["is_apple_silicon"] else "Intel (x86_64)"
+        print(format_line("macOS 版本", f"{mac_info['product_version']} ({mac_info['build_version']}) - {arch_desc}", True))
+        print(format_line("zsh 環境", str(mac_info["zshrc"]), mac_info["zshrc"].exists()))
+        print(format_line("~/.local/bin PATH", "已在當前環境生效" if mac_info["in_path_env"] else "未在當前 PATH (可執行 mac fix-path)", mac_info["in_path_env"]))
+        launchd_text = "已安裝並加載 (ACTIVE)" if mac_info["plist_loaded"] else ("已生成配置 (未加載)" if mac_info["plist_installed"] else "未安裝 (可執行 mac launchd install)")
+        print(format_line("Launchd 守護", launchd_text, mac_info["plist_loaded"]))
+
+    print("\n[3] 工作區狀態 (Workspace):")
     print(format_line("當前工作區", str(workspace), True))
     print(format_line("工作區 AGENTS.md", "已存在" if ws_agents.exists() else "未建立", ws_agents.exists()))
     print(format_line("NoWall 破甲狀態", "🔥 已激活生效 (ACTIVE)" if is_nowall_active else "未注入 (INACTIVE)", is_nowall_active))
 
-    print("\n[3] 原生 Skill 掛載狀態:")
+    print("\n[4] 原生 Skill 掛載狀態:")
     print(format_line("ai-nowall 技能", f"已安裝 ({skill_md.parent})" if skill_installed else "未安裝", skill_installed))
 
-    print("\n[4] 可用破甲規則預設 (Presets):")
+    print("\n[5] 可用破甲規則預設 (Presets):")
     for p in list_presets():
         print(f"  · [{p['id']}] -> {p['filename']} ({p['size']} bytes)")
 
     print("\n--------------------------------------------------")
     if not is_nowall_active:
         print("💡 提示: 執行 `ai-nowall apply` 立即為當前工作區激活破甲規則！")
+        if mac_info.get("is_mac") and not mac_info.get("plist_loaded"):
+            print("🍎 macOS 提示: 執行 `ai-nowall mac setup` 一鍵完成 macOS 系統層原生適配！")
     else:
         print("✅ 當前工作區已完全處於 Antigravity 無牆直接執行模式！")
     print("--------------------------------------------------\n")
 
+def handle_mac_command(action: str):
+    if not is_macos():
+        print("❌ 當前系統非 macOS (Darwin)，本指令不可用。")
+        return
+
+    if action == "status":
+        info = detect_macos_env()
+        print("🍎 macOS 系統層配置狀態:")
+        print(f"  · 系統版本: {info['product_version']} ({info['build_version']})")
+        print(f"  · 晶片架構: {info['arch']}")
+        print(f"  · Homebrew: {info['brew_prefix']} (存在: {info['has_brew']})")
+        print(f"  · ~/.local/bin in PATH: {info['in_path_env']} (在 .zshrc: {info['in_zshrc']})")
+        print(f"  · Launchd 守護: {info['plist_loaded']} (檔案: {info['plist_installed']})")
+    elif action == "fix-path":
+        res = fix_zsh_path()
+        if res.get("added"):
+            print(f"✓ 已將 ~/.local/bin 加入 {res['file']}")
+            print("💡 請在當前終端執行 `source ~/.zshrc` 生效。")
+        else:
+            print("✓ PATH 已經配置於 .zshrc 中。")
+    elif action == "launchd":
+        print("用法: ai-nowall mac launchd [install|uninstall|status]")
+    elif action == "clean-xattr":
+        count = 0
+        for p in PKG_ROOT.glob("**/*"):
+            if clear_quarantine(p):
+                count += 1
+        print(f"✓ 已清理 {count} 個檔案的 com.apple.quarantine 屬性。")
+    elif action == "setup":
+        print("🍏 正在一鍵執行 macOS 全套系統適配...")
+        # 1. 設置 zsh PATH
+        r_path = fix_zsh_path()
+        print(f"  ✓ PATH 配置: {r_path.get('file', 'OK')}")
+        # 2. 清理 Gatekeeper 屬性
+        clear_quarantine(PKG_ROOT / "bin" / "ai-nowall")
+        print("  ✓ Gatekeeper 隔離標記清理完成")
+        # 3. 安裝 Skill
+        install_skill()
+        print("  ✓ Antigravity Skill 安裝完成")
+        # 4. 安裝 Launchd 守護
+        r_launchd = install_launchd_service()
+        print(f"  ✓ macOS Launchd 守護安裝完成: {r_launchd['plist_path']}")
+        print("🎉 macOS 系統適配全數完成！")
+    else:
+        print(f"未知 mac 操作: {action}")
+        print("可選: setup, status, fix-path, clean-xattr, launchd [install|uninstall]")
+
 def main():
     parser = argparse.ArgumentParser(
-        description="ai-nowall — Google Antigravity (AGY) 專用破甲與無限制執行增強工具",
+        description="ai-nowall — Google Antigravity (AGY) 專用破甲與無限制執行增強工具 (macOS 原生深度適配)",
         formatter_class=argparse.RawTextHelpFormatter
     )
     subparsers = parser.add_subparsers(dest="subcommand", help="子指令")
@@ -220,7 +428,7 @@ def main():
     subparsers.add_parser("status", help="檢視當前 Antigravity 破甲、規則與技能狀態 (預設)")
 
     apply_parser = subparsers.add_parser("apply", help="應用破甲規則至 AGENTS.md")
-    apply_parser.add_argument("preset", nargs="?", default="nowall-default", help="預設名稱 (nowall-default / nowall-unrestricted / nowall-coder)")
+    apply_parser.add_argument("preset", nargs="?", default="nowall-default", help="預設名稱 (nowall-default / nowall-macos / nowall-unrestricted / nowall-coder)")
     apply_parser.add_argument("-g", "--global", dest="is_global", action="store_true", help="寫入全局配置 (~/.gemini/config/AGENTS.md)")
 
     revert_parser = subparsers.add_parser("revert", help="回滾還原至注入前的規則狀態")
@@ -230,6 +438,9 @@ def main():
 
     skill_parser = subparsers.add_parser("skill", help="管理 Antigravity Skill 掛載")
     skill_parser.add_argument("action", choices=["install", "uninstall", "remove"], default="install", nargs="?", help="install (安裝) 或 uninstall (移除)")
+
+    mac_parser = subparsers.add_parser("mac", help="macOS 系統層深度適配命令 (Darwin Native)")
+    mac_parser.add_argument("action", choices=["status", "setup", "fix-path", "launchd-install", "launchd-uninstall", "clean-xattr"], default="status", nargs="?", help="子操作")
 
     args = parser.parse_args()
 
@@ -270,6 +481,15 @@ def main():
                 print(f"✓ 成功移除 Skill: {res['removed']}")
             else:
                 print(f"· {res['message']}")
+    elif cmd == "mac":
+        if args.action == "launchd-install":
+            r = install_launchd_service()
+            print(f"✓ 已安裝 macOS launchd 服務: {r['plist_path']}")
+        elif args.action == "launchd-uninstall":
+            r = uninstall_launchd_service()
+            print("✓ 已卸載 macOS launchd 服務")
+        else:
+            handle_mac_command(args.action)
 
 if __name__ == "__main__":
     main()
